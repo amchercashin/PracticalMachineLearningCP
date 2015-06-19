@@ -1,0 +1,118 @@
+---
+title: "Practical Machine Learning Course Project"
+author: "Alexander Cherkashin"
+date: "Wednesday, June 10, 2015"
+output: html_document
+---
+
+## Summary
+In this project we'll build a classification model for predicting how well weight lifting exercise was performed. The data for this project come from this source: http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset). This dataset includes measurements from accelerometers on the belt, forearm, arm, and dumbell of 6 participants along with the evaluation how well the exercise was performed (participants were asked to perform barbell lifts correctly and incorrectly in 5 different ways). 
+
+## Some exploratory data analysis and data preparation
+First of all let's load the data and have a look on it:
+```{r data loading, cache=TRUE}
+training <- read.csv("./data/pml-training.csv")
+testing <- read.csv("./data/pml-testing.csv")
+dim(training)
+```
+Dataset has 19622 observation and 160 variables in it.
+
+Let's look for any columns with `NA`'s:
+```{r NAs}
+NAcolumns <- names(training)[sapply(training, anyNA)]
+sapply(training[, NAcolumns], function(col) {sum(is.na(col))})
+```
+
+It appears that we have some variables with `NA` value for the most of observations. Futhermore, the `NA` count among them is the same. Also, it is a count of `no` values in `new_window` variable: `sum(training$new_window=="no")` = `r sum(training$new_window=="no")`.
+
+It appears that `new_window` variable indicates some cases with additional measurments. In our set there are very few obesvations with such additional measurements so we'll filter these columns out along with `new_winow` both from training and testing datasets:
+```{r dropNAcol}
+training <- training[training$new_window=="no",!names(training) %in% c("new_window", NAcolumns)]
+testing <- testing[testing$new_window=="no",!names(testing) %in% c("new_window", NAcolumns)]
+```
+
+THere are also near zero variability vars:
+```{r near zero col, message=FALSE, cache=TRUE}
+library(caret)
+NZcolumns <- nearZeroVar(training)
+NZcolumns
+```
+
+If you look at `summary(training[,nearZeroVar(training)])` you will see that all these columns are empty. Looks like this values are `NA` too. Filter them out:
+```{r drop nz col}
+training <- training[,-NZcolumns]
+testing <- testing[,-NZcolumns]
+```
+
+Going further there is a column with subject names: `user_name`. We do not need it because we do not want our model to be subject specific. There is a column `X`, it appears that it contains monotonically increasing integer by 1 every row, starting from 1. It is something like counter of observations. We should filter it out to prevent model overfitting by counter. Also there are time related columns. Model shouldn't be time specific so we'll filter such columns too.
+
+Also in the testing set there is one more observation count: `problem_id`. We do not need it right now. Let's clean datasets from those columns:
+
+```{r drop time, message=FALSE}
+library(dplyr)
+training <- select(training, -(X:cvtd_timestamp))
+testing <- select(testing, -problem_id, -(X:cvtd_timestamp))
+```
+
+Nor sure what `num_window` variable is. It name sounds like some counter. Let's plot it against `classe`:
+```{r plot}
+qplot(x=0, num_window, data=training, fill=classe, geom="tile")
+```
+
+Indeed, looks like there are some chunks with same `classe` in this variable. To prevent overfitting we'll filter it out too.
+
+```{r drop num_window}
+training <- select(training, -num_window)
+testing <- select(testing, -num_window)
+```
+
+## Some notes about highly correlated predictors
+
+In the training dataset there are some highly correlated variables: 
+```{r correlated vars}
+library(tidyr)
+c <- data.frame(cor(select(training, -classe)))
+c[!upper.tri(c)]<-NA
+c$var1=row.names(c)
+c <- gather(c, var2, cor, -var1)
+c <- na.omit(c)
+c <- c[abs(c$cor)>.7,]
+c
+```
+
+For an example there are `r nrow(c)` cases of correlation more then 0.7.
+
+It doesn't bad to have them in dataset for prediction purposes with random forest model. Each tree will take only a small random number of variables to select the best one for each split. But it could be bad for feature impotency evaluation (you can read about this issue here: http://blog.datadive.net/selecting-good-features-part-iii-random-forests/ , http://link.springer.com/article/10.1186%2F1471-2105-8-25).
+
+The goal of this project is to make good prediction model so we'll leave all correlated variables.
+
+## Model building and cross-validation
+we'll try to build random forest model and perform cross-validation all by `train` function from `caret` package. The cross-validation will be performed by bootstrap.632 method 10 times.
+
+want to admit that using random forest usually there is no need in cross-validation because the algorithm itself use bootstrap sampling and produce out of the bag (OOB) error measurment that has been proven to be a good estimation of out of sample error.
+
+Additionally, we'll set apart 20% of observations for validation dataset and train model on other 80%. After all we'll check out of sample error rate estimates produes by OOB, bootstrap and validation set.
+
+We will use default `mtry` parameter for `randomForest` model equal to `floor(sqrt(ncol(x)))`.
+
+```{r model building, cache=TRUE, message=FALSE}
+library(doParallel)
+cl <- makeCluster(detectCores())
+registerDoParallel(cl)
+set.seed(123)
+
+inValidation <- createDataPartition(training$classe, p=.2, list=F)
+validation <- training[inValidation,]
+training <- training[-inValidation,]
+fitControl <- trainControl(method = "boot632", number=10)
+
+forest <- train(classe ~ ., data=training, method="rf", trControl = fitControl, tuneGrid=data.frame(mtry=floor(sqrt(ncol(training)))))
+cMatrix <- confusionMatrix(predict(forest, validation), validation$classe)
+```
+
+Let's check out of sample erorr rate estimates:
+```{r error rates}
+data.frame(OOB=forest$finalModel$err.rate[500], Bootstrap=1-forest$results[[2]], Validation=1-cMatrix$overall[[1]])
+```
+
+We can see that error rate estimates are very close. But the estimate with validation set is the highest (maybe to some little overfitting) and we choose this *estimate of out of sample error rate = `r 1-cMatrix$overall[[1]]`*.
